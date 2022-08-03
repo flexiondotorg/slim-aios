@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+LC_ALL=C
+
+# TODO
+# Add /usr/local/bin to the PATH
+# Add docker scan and docker sbom
+# Add syft, trivy, grype
+# Bootloader optimisations?
+#  - Reclaim GPU ram
+# Service optimisations?
+
+# Display help usage
+function usage () {
+  echo
+  echo "Usage"
+  echo "  $0 --arch <targetarchitecture>"
+  echo
+}
+
+function sync_from() {
+    if [ -z "${1}" ] || [ -z "${2}" ]; then
+        echo "ERROR! Source stages to sync were not passed."
+        exit 1
+    fi
+
+    local B_SOURCE="${1}"
+    local R_SOURCE="${2}"
+
+    if [ -d "${B}" ] && [ -d "${R}" ]; then
+        echo "Syncing from ${B_SOURCE}..."
+        rsync -aHAXx --delete "${B_SOURCE}/" "${B}/"
+        echo "Syncing from ${R_SOURCE}..."
+        rsync -aHAXx --delete "${R_SOURCE}/" "${R}/"
+    else
+        echo "ERROR! Either ${B} or ${R} do not exist!"
+        exit 1
+    fi
+}
+
+function nspawn() {
+    # Create basic resolv.conf for bind mounting inside the container
+    echo "nameserver 1.1.1.1" > "${R_STAGE_0}/resolv.conf"
+
+    if pidof apt-cacher-ng && [ -d "${R}/etc/apt/apt.conf.d" ]; then
+        echo "Acquire::http { Proxy \"http://${APT_CACHE_IP}:3142\"; }" > "${R}/etc/apt/apt.conf.d/90cache"
+    fi
+
+    # Make sure the container has a machine-id
+    systemd-machine-id-setup --root "${R}" --print
+
+    echo "Running: ${@}"
+    # Bind mount resolv.conf and the firmware, set the hostname and spawn
+    systemd-nspawn \
+      --resolv-conf=off \
+      --bind-ro="${R_STAGE_0}/resolv.conf":/etc/resolv.conf \
+      --bind="${B}":/boot/firmware \
+      --machine="slim-aios" \
+      --directory "${R}" "${@}"
+
+    if [ -e "${R}/etc/apt/apt.conf.d/90cache" ]; then
+        rm -f "${R}/etc/apt/apt.conf.d/90cache"
+    fi
+}
+
+function stage_01_bootstrap() {
+    local REPO=""
+    export B="${B_STAGE_1}"
+    export R="${R_STAGE_1}"
+
+    rm -rf "${B_STAGE_1}"/*
+    rm -rf "${R_STAGE_1}"/*
+
+    # Required tools on the host
+    apt-get -y install binfmt-support debootstrap device-tree-compiler git \
+    iproute2 qemu-user-static rsync systemd-container ubuntu-keyring util-linux \
+    whois xz-utils
+
+    # Bootstrap a minimal Ubuntu.
+    #   Includes:
+    #     - cloud-guest-utils: instead of cloud-image-utils which requires qemu
+    #     - nano: the best text editor ever
+    #   Excludes:
+    #     - ubuntu-advantage-tools: not required
+
+    if pidof apt-cacher-ng; then
+        REPO="http://localhost:3142/ports.ubuntu.com/"
+    else
+        REPO="http://ports.ubuntu.com/"
+    fi
+
+    debootstrap \
+        --arch="${IMG_ARCH}" \
+        --cache-dir="${R_STAGE_0}" \
+        --components=main,restricted,universe,multiverse \
+        --exclude=debconf-i18n,distro-info,dmsetup,eject,info,netcat-openbsd,ubuntu-minimal,ubuntu-advantage-tools,vim-tiny,vim-common,xxd \
+        --foreign \
+        --include=cloud-guest-utils,nano \
+        "${IMG_RELEASE}" "${R}" "${REPO}"
+    nspawn /debootstrap/debootstrap \
+        --second-stage
+
+    sed "s|RELEASE|${IMG_RELEASE}|g" "root/etc/apt/sources.list" > "${R}/etc/apt/sources.list"
+
+    echo "slim-aios" > "${R}/etc/hostname"
+    sed -i "1s|.*|127.0.0.1\tlocalhost slim-aios|" "${R}/etc/hosts"
+
+    # Set locale to C.UTF-8 by default.
+    # https://git.launchpad.net/livecd-rootfs/tree/live-build/auto/build#n159
+    echo "LANG=C.UTF-8" > "${R}/etc/default/locale"
+
+    # Disable cron; systemd timers have replaced cron
+    nspawn systemctl disable cron
+
+    # Disable motd-news
+    nspawn systemctl disable motd-news.service motd-news.timer
+
+    # Still considering this.
+    nspawn systemctl disable apt-daily.timer apt-daily-upgrade.timer
+
+    nspawn systemctl disable setvtrgb.service
+
+    nspawn apt-get -y update
+    nspawn apt-get -y upgrade
+    nspawn apt-get -y dist-upgrade
+
+    # # Add some of ubuntu-standard tools & first boot filesystem expansion
+    #  - Insure that cloud-image-utils do not get installed
+    nspawn apt-get -y install --no-install-recommends cloud-guest-utils \
+    cloud-initramfs-growroot dosfstools dropbear file hdparm lshw lsof man-db \
+    pciutils pci.ids psmisc usbutils usb.ids wget xz-utils
+}
+
+function stage_02_docker() {
+    export B="${B_STAGE_2}"
+    export R="${R_STAGE_2}"
+    sync_from "${B_STAGE_1}" "${R_STAGE_1}"
+
+    if $(${INCLUDE_DOCKER}); then
+        # deb-get
+        nspawn apt-get -y install --no-install-recommends curl wget
+        nspawn wget -q "https://raw.githubusercontent.com/wimpysworld/deb-get/0.3.0/deb-get" -O /usr/bin/deb-get
+        chmod 755 "${R}/usr/bin/deb-get"
+        nspawn deb-get install deb-get
+
+        # Disable unattended-upgrades
+        nspawn systemctl disable unattended-upgrades
+
+        # Install docker
+        nspawn deb-get install docker-ce docker-compose-plugin
+
+        # Install DockerSlim
+        nspawn wget -q "https://raw.githubusercontent.com/docker-slim/docker-slim/master/scripts/install-dockerslim.sh" -O /tmp/install-dockerslim.sh
+        nspawn chmod 755 /tmp/install-dockerslim.sh
+        nspawn /tmp/install-dockerslim.sh
+    fi
+}
+
+function stage_03_kernel() {
+    export B="${B_STAGE_3}"
+    export R="${R_STAGE_3}"
+    sync_from "${B_STAGE_2}" "${R_STAGE_2}"
+
+    cp "root/etc/fstab" "${R}/etc/"
+
+    # Adds lz4 and z3fold modules to initramfs.
+    # - https://ubuntu.com/blog/how-low-can-you-go-running-ubuntu-desktop-on-a-2gb-raspberry-pi-4
+    echo lz4    >> "${R}/etc/initramfs-tools/modules"
+    echo z3fold >> "${R}/etc/initramfs-tools/modules"
+
+    # Swap
+    # - https://git.launchpad.net/livecd-rootfs/tree/live-build/ubuntu/hooks/099-ubuntu-image-customization.chroot
+    mkdir -p "${R}/usr/lib/systemd/system/swap.target.wants/"
+    cp "root/usr/lib/systemd/system/mkswap.service" "${R}/usr/lib/systemd/system/mkswap.service"
+    nspawn ln -s /usr/lib/systemd/system/mkswap.service /usr/lib/systemd/system/swap.target.wants/mkswap.service
+    cp "root/usr/lib/systemd/system/swapfile.swap" "${R}/usr/lib/systemd/system/swapfile.swap"
+    nspawn ln -s /usr/lib/systemd/system/swapfile.swap /usr/lib/systemd/system/swap.target.wants/swapfile.swap
+
+    nspawn apt-get -y install --no-install-recommends flash-kernel \
+    libraspberrypi0 libraspberrypi-bin linux-firmware-raspi \
+    linux-image-raspi linux-modules-extra-raspi pi-bluetooth rpi-eeprom \
+    ubuntu-raspi-settings
+
+    local NEW_KERNEL=$(ls -1 "${R}"/boot/vmlinuz-* | tail -n1 | awk -F/ '{print $NF}' | cut -d'-' -f2-4)
+    if [ -z "${NEW_KERNEL}" ]; then
+        echo "ERROR! Could not detect the new kernel version"
+        exit 1
+    fi
+    echo "Kernel: ${NEW_KERNEL}"
+
+    # Copy firmware, devicetree, overlays and kernel to the boot file system
+    cp -v "${R}/lib/linux-firmware-raspi/"* "${B}/"
+    cp -av "${R}/lib/firmware/${NEW_KERNEL}/device-tree/"* "${B}/"
+
+    # Move the arm64 device-tree
+    if [ -d "${B}/broadcom" ]; then
+        mv -v "${B}/broadcom/"*.dtb "${B}"/
+        rm -rf "${B}/broadcom"
+    fi
+
+    cp -av "${R}/boot/vmlinuz-${NEW_KERNEL}" "${B}/vmlinuz"
+    cp -av "${R}/boot/initrd.img-${NEW_KERNEL}" "${B}/initrd.img"
+}
+
+function stage_04_config() {
+    export B="${B_STAGE_4}"
+    export R="${R_STAGE_4}"
+    sync_from "${B_STAGE_3}" "${R_STAGE_3}"
+
+    # Append case specific cmdline.txt & config.txt
+    cp -v "boot/README" "${B}/"
+    cp "boot/config.txt" "${B}/"
+    cp "boot/cmdline.txt" "${B}/"
+
+    # Apply ARM64 tweaks
+    if [ "${IMG_ARCH}"  == "arm64" ]; then
+        echo "# Config settings specific to arm64
+arm_64bit=1
+dtoverlay=dwc2" >> "${B}/config.txt"
+    fi
+
+    mkdir -p "${R}/"etc/netplan
+    cp root/etc/netplan/config.yaml "${R}/"etc/netplan/
+
+    cp root/etc/default/dropbear "${R}/"etc/default/
+
+    nspawn systemctl disable hciuart bluetooth
+    nspawn systemctl set-default multi-user.target
+
+    # Create user and groups
+    local DATE=""
+    DATE=$(date +%m%H%M%S)
+    local PASSWD=""
+    PASSWD=$(mkpasswd -m sha-512 "${USER_PASS}" "${DATE}")
+    nspawn addgroup --gid 1000 "${USER_NAME}"
+
+    nspawn adduser --gecos "${USER_NAME^}" --add_extra_groups --disabled-password --home "${USER_HOME}" --gid 1000 --uid 1000 "${USER_NAME}"
+    nspawn usermod -a -G adm,docker,sudo -p "${PASSWD}" "${USER_NAME}"
+    #nspawn chage -d 0 "${USER_NAME}"
+
+    # Disable the existing motd scripts
+    for MOTD in 00-header 10-help-text 50-motd-news 92-unattended-upgrades; do
+        chmod 644 "${R}/etc/update-motd.d/${MOTD}"
+    done
+    echo -e "Welcome to Slim.AI OS for Raspberry Pi\n - Built with Ubuntu ${IMG_VER}\n" > "${R}/etc/motd"
+}
+
+function stage_05_clean() {
+    export B="${B_STAGE_5}"
+    export R="${R_STAGE_5}"
+    sync_from "${B_STAGE_4}" "${R_STAGE_4}"
+
+    nspawn apt-get -y autoremove
+    nspawn apt-get -y autoclean
+    nspawn apt-get -y clean
+
+    rm -f "${B}"/{*.bak,*.old}
+    rm -f "${R}"/wget-log
+    rm -f "${R}"/boot/{*.bak,*.old}
+    rm -f "${R}"/etc/dropbear/dropbear_*_host_key
+    rm -f "${R}"/etc/ssh/ssh_host_*_key*
+    rm -f "${R}"/etc/apt/*.save
+    rm -f "${R}"/etc/apt/apt.conf.d/90cache
+    rm -f "${R}"/etc/apt/sources.list.d/*.save
+    rm -f "${R}"/root/.wget-hsts
+    rm -rf "${R}"/tmp/*
+    rm -f "${R}"/var/log/apt/*
+    rm -f "${R}"/var/log/alternatives.log
+    rm -f "${R}"/var/log/bootstrap.log
+    rm -f "${R}"/var/log/dpkg.log
+    rm -f "${R}"/var/log/fontconfig.log
+    rm -f "${R}"/var/cache/debconf/*-old
+    rm -f "${R}"/var/cache/deb-get/*.json
+    rm -f "${R}"/var/crash/*
+    rm -rf "${R}"/var/lib/apt/lists/*
+    rm -f "${R}"/var/lib/dpkg/*-old
+    [ -L "${R}"/var/lib/dbus/machine-id ] || rm -f "${R}"/var/lib/dbus/machine-id
+    echo '' > "${R}"/etc/machine-id
+}
+
+function stage_06_image() {
+    export B="${B_STAGE_5}"
+    export R="${R_STAGE_5}"
+
+    # Build the image file
+    local SIZE_BOOT="256"
+    local SIZE_ROOT=0
+    local SIZE_IMG=0
+    local SIZE_PAD=0
+    # Calculate image size accounting for boot parition + 5%
+    SIZE_ROOT=$(du -cs --block-size=MB "${R}" | tail -n1 | cut -d'M' -f1)
+    SIZE_PAD=$(( (SIZE_ROOT / 10) / 2 ))
+    SIZE_IMG=$((SIZE_BOOT + SIZE_ROOT + SIZE_PAD))
+
+    # Create an empty file file.
+    rm -fv "${TMP_DIR}/${IMG_OUT}"
+    fallocate -l "${SIZE_IMG}"M "${TMP_DIR}/${IMG_OUT}"
+
+    # Initialising: msdos
+    parted -s "${TMP_DIR}/${IMG_OUT}" mktable msdos
+    echo "Creating /boot/firmware partition"
+    parted -a optimal -s "${TMP_DIR}/${IMG_OUT}" mkpart primary fat32 1 "${SIZE_BOOT}MB"
+    echo "Creating / partition"
+    parted -a optimal -s "${TMP_DIR}/${IMG_OUT}" mkpart primary ext4 "${SIZE_BOOT}MB" 100%
+    echo "Making partition 1 bootable"
+    parted -s "${TMP_DIR}/${IMG_OUT}" set 1 boot on
+
+    PARTED_OUT=$(parted -s "${TMP_DIR}/${IMG_OUT}" unit b print)
+    BOOT_OFFSET=$(echo "${PARTED_OUT}" | grep -e '^ 1'| xargs echo -n \
+    | cut -d" " -f 2 | tr -d B)
+    BOOT_LENGTH=$(echo "${PARTED_OUT}" | grep -e '^ 1'| xargs echo -n \
+    | cut -d" " -f 4 | tr -d B)
+
+    ROOT_OFFSET=$(echo "${PARTED_OUT}" | grep -e '^ 2'| xargs echo -n \
+    | cut -d" " -f 2 | tr -d B)
+    ROOT_LENGTH=$(echo "${PARTED_OUT}" | grep -e '^ 2'| xargs echo -n \
+    | cut -d" " -f 4 | tr -d B)
+
+    BOOT_LOOP=$(losetup --show -f -o "${BOOT_OFFSET}" --sizelimit "${BOOT_LENGTH}" "${TMP_DIR}/${IMG_OUT}")
+    ROOT_LOOP=$(losetup --show -f -o "${ROOT_OFFSET}" --sizelimit "${ROOT_LENGTH}" "${TMP_DIR}/${IMG_OUT}")
+    echo "/boot/firmware: offset ${BOOT_OFFSET}, length ${BOOT_LENGTH}"
+    echo "/:              offset ${ROOT_OFFSET}, length ${ROOT_LENGTH}"
+
+    mkfs.vfat -n system-boot -S 512 -s 16 -v "${BOOT_LOOP}"
+    mkfs.ext4 -L writable -m 0 "${ROOT_LOOP}"
+
+    MOUNTDIR="${TMP_DIR}/image"
+    mkdir -p "${MOUNTDIR}"
+    mount -v "${ROOT_LOOP}" "${MOUNTDIR}" -t ext4
+    mkdir -p "${MOUNTDIR}/boot/firmware"
+    mount -v "${BOOT_LOOP}" "${MOUNTDIR}/boot/firmware" -t vfat
+    echo "Syncing root..."
+    rsync -aHAXx --delete "${R}"/ "${MOUNTDIR}/"
+    echo "Syncing boot..."
+    rsync -aHAXx --delete "${B}"/ "${MOUNTDIR}/boot/firmware/"
+    mkdir -p "${MOUNTDIR}/.disk"
+    date +"%Y%m%d" > "${MOUNTDIR}/.disk/info"
+    sync
+    umount -l "${MOUNTDIR}/boot/firmware"
+    umount -l "${MOUNTDIR}"
+    losetup -d "${ROOT_LOOP}"
+    losetup -d "${BOOT_LOOP}"
+    ls -lh "${TMP_DIR}/${IMG_OUT}"
+    rm -rf "${MOUNTDIR}"
+}
+
+function stage_07_compress() {
+    export B="${B_STAGE_5}"
+    export R="${R_STAGE_5}"
+    local CPU_PHYSICAL=$(grep 'cpu cores' /proc/cpuinfo | head -n1 | cut -d':' -f2 | tr -d ' ')
+
+    # NOTE! Disabled while iterating
+    echo "Compressing ${IMG_OUT}.xz"
+    rm "${TMP_DIR}/${IMG_OUT}.xz" 2>/dev/null
+    xz --keep -T "${CPU_PHYSICAL}" "${TMP_DIR}/${IMG_OUT}"
+    ls -lh "${TMP_DIR}/${IMG_OUT}.xz"
+
+    local HASH="sha256"
+    local OUT_HASH="${TMP_DIR}/${IMG_OUT}.xz.${HASH}"
+
+    rm -f "${OUT_HASH}"
+
+    if [ -e "${TMP_DIR}/${IMG_OUT}.xz" ]; then
+        echo "Hashing ${IMG_OUT}.xz"
+        ${HASH}sum "${TMP_DIR}/${IMG_OUT}.xz" > "${OUT_HASH}"
+        sed -i -r "s/ .*\/(.+)/  \1/g" "${OUT_HASH}"
+    else
+        echo "WARNING! Didn't find ${TMP_DIR}/${IMG_OUT} to hash."
+    fi
+}
+
+if [ -z "${SUDO_USER}" ]; then
+  echo "ERROR! You must use sudo to run this script: sudo ./$(basename "${0}")"
+  exit 1
+else
+  SUDO_HOME=$(getent passwd "${SUDO_USER}" | cut -d: -f6)
+fi
+
+INCLUDE_DOCKER="true"
+
+# Install apt-cacher-ng on the host and this script will use it.
+APT_CACHE_IP=$(ip route get 1.1.1.1 | head -n 1 | cut -d' ' -f 7)
+IMG_QUALITY="-alpha1"
+IMG_VER="22.04"
+IMG_RELEASE="jammy"
+IMG_ARCH="arm64"
+IMG_STAMP=$(date +%y.%j)
+
+# TODO: Replace with cloud-init
+USER_NAME="slimdevops"
+USER_PASS="slimai"
+USER_HOME="/home/${USER_NAME}"
+TMP_DIR="${SUDO_HOME}/Builds"
+
+# Take command line arguments
+if [ $# -lt 1 ]; then
+    usage
+    exit 0
+else
+    while [ $# -gt 0 ]; do
+        case "${1}" in
+            -arch|--arch)
+                IMG_ARCH="${2}"
+                shift
+                shift;;
+            *)
+                echo "[!] ERROR: \"${1}\" is not a supported parameter."
+                usage
+                exit 1;;
+        esac
+    done
+fi
+IMG_OUT="slim-aios-${IMG_STAMP}${IMG_QUALITY}-${IMG_ARCH}.img"
+
+# Create caches
+for LOOP in 0 1 2 3 4 5; do
+    case ${LOOP} in
+      0)
+        export R_STAGE_${LOOP}="${TMP_DIR}/${IMG_ARCH}/slim-aios/${IMG_VER}/${LOOP}_cache"
+        mkdir -p "${TMP_DIR}/${IMG_ARCH}/slim-aios/${IMG_VER}/${LOOP}_cache" 2>/dev/null
+        ;;
+      1)
+        export B_STAGE_${LOOP}="${TMP_DIR}/${IMG_ARCH}/slim-aios/${IMG_VER}/${LOOP}_boot"
+        export R_STAGE_${LOOP}="${TMP_DIR}/${IMG_ARCH}/slim-aios/${IMG_VER}/${LOOP}_root"
+        mkdir -p "${TMP_DIR}/${IMG_ARCH}/slim-aios/${IMG_VER}/${LOOP}_boot" 2>/dev/null
+        mkdir -p "${TMP_DIR}/${IMG_ARCH}/slim-aios/${IMG_VER}/${LOOP}_root/boot/firmware" 2>/dev/null
+        ;;
+      *)
+        export B_STAGE_${LOOP}="${TMP_DIR}/${IMG_ARCH}/slim-aios/${IMG_VER}/${LOOP}_boot"
+        export R_STAGE_${LOOP}="${TMP_DIR}/${IMG_ARCH}/slim-aios/${IMG_VER}/${LOOP}_root"
+        mkdir -p "${TMP_DIR}/${IMG_ARCH}/slim-aios/${IMG_VER}/${LOOP}_boot" 2>/dev/null
+        mkdir -p "${TMP_DIR}/${IMG_ARCH}/slim-aios/${IMG_VER}/${LOOP}_root/boot/firmware" 2>/dev/null
+        ;;
+    esac
+done
+
+stage_01_bootstrap
+stage_02_docker
+stage_03_kernel
+stage_04_config
+stage_05_clean
+stage_06_image
+stage_07_compress
