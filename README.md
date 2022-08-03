@@ -42,7 +42,7 @@ Alpha images of Slim.AI OS are [available for download from the GitHub releases]
 
 It is best to run the `slim-aios-image` on an Ubuntu 22.04 x86 64-bit
 workstation, ideally running in a VM via [Quickemu](https://github.com/quickemu-project/quickemu).
-If using a fresh [Quickemu](https://github.com/quickemu-project/quickemu) VM you will need to set the `disk_size` parameter large enough to complete the build (around 26G). This can be achieved by adding `disk_size="32G"` to `ubuntu-jammy.conf` before running `quickemu` to create the VM. Alternatively you could mount external storage into the container for the build area. You'll also need at to `sudo apt install git`.
+If using a fresh [Quickemu](https://github.com/quickemu-project/quickemu) VM you will need to set the `disk_size` parameter large enough to complete the build (around 26G). This can be achieved by adding `disk_size="32G"` to `ubuntu-jammy.conf` before running `quickemu` to create the VM. Alternatively you could mount external storage into the container for the build area. You'll also need to `sudo apt install git`.
 
 The following incantation will build a Slim.AI OS arm64 image for Raspberry Pi.
 You can replace `arm64` with `armhf` to build an image for 32-bit ARM.
