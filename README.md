@@ -60,7 +60,7 @@ IMG_RELEASE="jammy"
 
 ### What is the default username and password:
 
-This is the default username and password for logging into Retro Home via SSH
+This is the default username and password for logging into Slim.AI OS via SSH
 or the desktop.
 
   * Username: `slimdevops`
